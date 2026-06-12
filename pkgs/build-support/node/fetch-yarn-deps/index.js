@@ -21,32 +21,43 @@ const exec = async (...args) => {
   return res
 }
 
-const downloadFileHttps = (fileName, url, expectedHash, verbose, hashType = 'sha1') => {
+const downloadFileHttps = (fileName, url, expectedHash, verbose, netrcContents, hashType = 'sha1') => {
   return new Promise((resolve, reject) => {
-    const get = (url, redirects = 0) => https.get(url, (res) => {
-      if(redirects > 10) {
-        reject('Too many redirects!');
-        return;
+    const get = (uri, redirects = 0) => {
+      const url = new URL(uri);
+      const netrcMatch = (netrcContents || {})[url.hostname];
+      if (netrcMatch) {
+        url.username = netrcMatch.login || "Bearer"
+        url.password = netrcMatch.password
       }
-      if(res.statusCode === 301 || res.statusCode === 302) {
-        const location = new URL(res.headers.location, url);
-        if (verbose) console.log('following redirect to ' + location);
-        return get(location, redirects + 1);
-      }
-      const file = fs.createWriteStream(fileName)
-      const hash = crypto.createHash(hashType)
-      res.pipe(file)
-      res.pipe(hash).setEncoding('hex')
-      res.on('end', () => {
-        file.close()
-        const h = hash.read()
-        if (expectedHash === undefined){
-          console.log(`Warning: lockfile url ${url} doesn't end in "#<hash>" to validate against. Downloaded file had hash ${h}.`);
-        } else if (h != expectedHash) return reject(new Error(`hash mismatch, expected ${expectedHash}, got ${h} for ${url}`))
-        resolve()
+      https.get(url, (res) => {
+        if(redirects > 10) {
+          reject('Too many redirects!');
+          return;
+        }
+        if(res.statusCode === 301 || res.statusCode === 302) {
+          const location = new URL(res.headers.location, url);
+          if (verbose) console.log('following redirect to ' + location);
+          return get(location, redirects + 1);
+        }
+        if(res.statusCode === 401) {
+          reject("Not authorized to download package!")
+        }
+        const file = fs.createWriteStream(fileName)
+        const hash = crypto.createHash(hashType)
+        res.pipe(file)
+        res.pipe(hash).setEncoding('hex')
+        res.on('end', () => {
+          file.close()
+          const h = hash.read()
+          if (expectedHash === undefined){
+            console.log(`Warning: lockfile url ${url} doesn't end in "#<hash>" to validate against. Downloaded file had hash ${h}.`);
+          } else if (h != expectedHash) return reject(new Error(`hash mismatch, expected ${expectedHash}, got ${h} for ${url}`))
+          resolve()
+        })
+        res.on('error', e => reject(e))
       })
-      res.on('error', e => reject(e))
-    })
+    }
     get(url)
   })
 }
@@ -90,7 +101,7 @@ const isGitUrl = pattern => {
   return false
 }
 
-const downloadPkg = (pkg, verbose) => {
+const downloadPkg = (pkg, verbose, netrcContents) => {
   for (let marker of ['@file:', '@link:']) {
     const split = pkg.key.split(marker)
     if (split.length == 2) {
@@ -122,9 +133,9 @@ const downloadPkg = (pkg, verbose) => {
   } else if (url.startsWith('https://')) {
     if (typeof pkg.integrity === 'string' || pkg.integrity instanceof String) {
       const [ type, checksum ] = pkg.integrity.split('-')
-      return downloadFileHttps(fileName, url, Buffer.from(checksum, 'base64').toString('hex'), verbose, type)
+      return downloadFileHttps(fileName, url, Buffer.from(checksum, 'base64').toString('hex'), verbose, netrcContents, type)
     }
-    return downloadFileHttps(fileName, url, hash, verbose)
+    return downloadFileHttps(fileName, url, hash, verbose, netrcContents)
   } else if (url.startsWith('file:')) {
     console.warn(`ignoring unsupported file:path url "${url}"`)
   } else {
@@ -155,11 +166,11 @@ const uniqueBy = (arr, callback) => {
   return [...map.values()]
 }
 
-const prefetchYarnDeps = async (lockContents, verbose) => {
+const prefetchYarnDeps = async (lockContents, verbose, netrcContents) => {
   const lockData = lockfile.parse(lockContents)
   await performParallel(
     uniqueBy(Object.entries(lockData.object), ([_, value]) => value.resolved)
-    .map(([key, value]) => () => downloadPkg({ key, ...value }, verbose))
+    .map(([key, value]) => () => downloadPkg({ key, ...value }, verbose, netrcContents))
   )
   await fs.promises.writeFile('yarn.lock', lockContents)
   if (verbose) console.log('Done')
@@ -173,16 +184,60 @@ Options:
   -h --help         Show this help
   -v --verbose      Verbose output
   --builder         Only perform the download to current directory, then exit
+  --netrc-file      Use netrc file while downloading
+  --netrc-optional  Ignore missing netrc file
 `)
   process.exit(1)
 }
 
+/* This implementation is taken from https://github.com/camshaft/netrc/blob/master/index.js and slightly modified */
+const parseNetrc = (content) => {
+  // Remove comments
+  const lines = content.split('\n');
+  for (var n in lines) {
+    var i = lines[n].indexOf('#');
+    if (i > -1) lines[n] = lines[n].substring(0, i);
+  }
+  content = lines.join('\n');
+
+  const tokens = content.split(/[ \t\n\r]+/);
+  const machines = {};
+  let m;
+
+  // if first index in array is empty string, strip it off (happens when first line of file is comment. Breaks the parsing)
+  if (tokens[0] === '') tokens.shift();
+
+  for(let i = 0, key, value; i < tokens.length; i+=2) {
+    key = tokens[i];
+    value = tokens[i+1];
+
+    // Whitespace
+    if (!key || !value) continue;
+
+    // We have a new machine definition
+    if (key === 'machine') {
+      m = {};
+      machines[value] = m;
+    }
+    // key=value
+    else {
+      m[key] = value;
+    }
+  }
+
+  return machines
+};
+
 const main = async () => {
   const args = process.argv.slice(2)
-  let next, lockFile, verbose, isBuilder
+  let next, lockFile, verbose, isBuilder, netrcFile, netrcOptional
   while (next = args.shift()) {
     if (next == '--builder') {
       isBuilder = true
+    } else if (next === "--netrc-file") {
+      netrcFile = args.shift();
+    } else if (next === "--netrc-optional") {
+      netrcOptional = true;
     } else if (next == '--verbose' || next == '-v') {
       verbose = true
     } else if (next == '--help' || next == '-h') {
@@ -200,20 +255,33 @@ const main = async () => {
     showUsage()
   }
 
+  let netrcContents
+  if (netrcFile) {
+    try {
+      const rawNetrcContent = await fs.promises.readFile(netrcFile, 'utf-8');
+      netrcContents = parseNetrc(rawNetrcContent);
+    } catch (error) {
+      if (!netrcOptional || error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+
   if (isBuilder) {
-    await prefetchYarnDeps(lockContents, verbose)
+    await prefetchYarnDeps(lockContents, verbose, netrcContents)
   } else {
     const { stdout: tmpDir } = await exec('mktemp', [ '-d' ])
 
     try {
       process.chdir(tmpDir.trim())
-      await prefetchYarnDeps(lockContents, verbose)
+      await prefetchYarnDeps(lockContents, verbose, netrcContents)
       const { stdout: hash } = await exec('nix-hash', [ '--type', 'sha256', '--base32', tmpDir.trim() ])
       console.log(hash)
     } finally {
       await exec('rm', [ '-rf', tmpDir.trim() ])
     }
   }
+  process.exit(0);
 }
 
 main()

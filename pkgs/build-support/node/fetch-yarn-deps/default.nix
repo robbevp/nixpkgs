@@ -147,7 +147,7 @@ in
 
               yarnLock=''${yarnLock:=$PWD/yarn.lock}
               mkdir -p $out
-              (cd $out; prefetch-yarn-deps --verbose --builder $yarnLock)
+              (cd $out; prefetch-yarn-deps --verbose --builder $yarnLock ${args.prefetchArgs or ""})
 
               runHook postBuild
             '';
